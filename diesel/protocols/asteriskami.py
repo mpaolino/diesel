@@ -1,16 +1,17 @@
 import diesel
-from diesel import (Client, call, until_eol, until, receive,
-                    fire, send, first, fork, sleep)
+from diesel import (Client, call)
 import uuid
 
 import ipdb
 
-
 AMI_PORT = 5038
+
 
 class AsteriskAMIError(Exception): pass
 
+
 class AsteriskAMIClient(Client):
+
     def __init__(self, host='localhost', port=AMI_PORT, username=None,
                  secret=None, **kw):
         if username is None:
@@ -31,8 +32,7 @@ class AsteriskAMIClient(Client):
                          'UnParkedCall', 'ParkedCalls', 'Cdr',
                          'ParkedCallsComplete', 'QueueParams',
                          'QueueMember' ]
-        norm_events = map(lambda x: x.lower(), self._events)
-        self._subscriptions = dict.fromkeys(norm_events)
+        self._subscriptions = dict.fromkeys(self._events)
         Client.__init__(self, host, port, **kw)
 
 
@@ -44,31 +44,39 @@ class AsteriskAMIClient(Client):
         self.on_logged_in()
 
     def on_logged_in(self):
-        #ipdb.set_trace()
         pass
 
     @call
     def _dispatch_messages(self):
         while True:
-            msg = until('\r\n\r\n')
-            parsed = self._parse(msg)
-            ipdb.set_trace()
+            # Workaround for bug in diesel that won't reschedule loop
+            # when using until
+            #data = diesel.until('\r\n\r\n')
+            ev, data = diesel.first(sleep=0, until='\r\n\r\n')
+            if ev == 'sleep':
+                continue
+            parsed = self._parse(data)
+            #print(parsed)
             if 'actionid' in parsed:
                 diesel.fire(parsed['actionid'], parsed)
             elif 'event' in parsed:
                 event = parsed['event']
-                if event in self._subscriptions:
-                    # Launch one fork per subscribed function
-                    map(diesel.fork_child, self._subscriptions[event])
+                if event in self._subscriptions and self._subscriptions[event]:
+                    # Launch one fork per subscribed handler
+                    for sub in self._subscriptions[event]:
+                        diesel.fork_child(sub, parsed)
                 else:
                     # Messages which are not recognized or
-                    # doesn't have a callback are not interesing
+                    # doesn't have a handler are not interesting
                     # TODO: Log something
-                    pass 
+                    pass
 
     def _parse(self, message):
-        message_lines = message.split('\r\n')
         response = {}
+        if message is None:
+            return response
+
+        message_lines = message.split('\r\n')
         # TODO: rewrite this
         for line in message_lines:
             try:
@@ -76,18 +84,21 @@ class AsteriskAMIClient(Client):
                 response[key.lower()] = value
             except ValueError:
                 pass
-        return response 
+        return response
 
     @call
     def _get_ami_version(self):
-        version = until_eol()
+        version = diesel.until_eol()
         return version
 
     def _do_login(self):
-        login_cmds = { 'action': 'login',
+        '''
+            Authenticate
+        '''
+        login_args = { 'action': 'login',
                        'username': self.username,
                        'secret': self.secret }
-        response = self._send_command(login_cmds)
+        response = self._send_command(login_args)
         if 'response' not in response or response['response'] != 'Success' \
             or response['message'] != 'Authentication accepted':
             raise AsteriskAMIError('Authentication failed')
@@ -99,12 +110,10 @@ class AsteriskAMIClient(Client):
     def _send_command(self, cmd_dict):
         '''
             Receives a command dictionary and sends as action to Asterisk
-            If a timeout is given this method will wait for a response,
-            raising AsteriskAMITimeout in case a response is not received
-            in time.
+            it will also wait and return a response 
         '''
         if not isinstance(cmd_dict, dict):
-            raise AsteriskAMIError('cmd_dict must be of dict type')
+            raise AsteriskAMIError('cmd_dict must be a dict type')
         if len(cmd_dict) == 0:
             raise AsteriskAMIError('refusing to send empty command')
 
@@ -117,13 +126,13 @@ class AsteriskAMIClient(Client):
                    cmd_dict.items())
         # Append last empty line and send
         cmds.append('\r\n')
-        send(''.join(cmds))
+        diesel.send(''.join(cmds))
         response = diesel.wait(action_id)
-        return response 
+        return response
 
     def subscribe(self, event, handler):
         '''
-            Subscribe handler to event handler chain
+            Subscribe handler to event handler list
         '''
         if not isinstance(event, (str, unicode)):
             raise AsteriskAMIError('event must be a str or unicode type')
@@ -131,12 +140,9 @@ class AsteriskAMIClient(Client):
         if not callable(handler):
             raise AsteriskAMIError('handler must be callable')
 
-        event = event.lower()
         if event not in self._subscriptions:
-            raise AsteriskAMIError('event \'%s\' not valid' % str(event)) 
+            raise AsteriskAMIError('event \'%s\' not valid' % str(event))
 
         if self._subscriptions[event] is None:
             self._subscriptions[event] = []
         self._subscriptions[event].append(handler)
-
-###############################################################################

@@ -2,9 +2,7 @@
 '''Simple udp echo server and client.
 '''
 import sys
-from diesel import (
-    UDPService, UDPClient, call, send, datagram, quickstart, receive,
-)
+from diesel import (UDPService, UDPClient, call, send, datagram, quickstart, receive)
 
 
 class EchoClient(UDPClient):
@@ -17,7 +15,8 @@ class EchoClient(UDPClient):
     @call
     def say(self, msg):
         send(msg)
-        return receive(datagram)
+        data = receive()
+        print(data)
 
 def echo_server():
     """The UDPService callback.
@@ -28,15 +27,17 @@ def echo_server():
     acting upon them.
 
     """
+    from diesel import console
+    console.install_console_signal_handler()
     while True:
         data = receive(datagram)
-        send("you said %s" % data)
+        print("I received %s" % data)
 
 def echo_client():
     client = EchoClient('localhost', 8013)
     while True:
         msg = raw_input("> ")
-        print client.say(msg)
+        client.say(msg)
 
 if len(sys.argv) == 2:
     if 'client' in sys.argv[1]:
