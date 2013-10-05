@@ -1,3 +1,14 @@
+#
+# AsteriskAMI -- Asterisk Protocol for diesel
+#
+# Copyright (c) 2013, Miguel Paolino
+#
+# Miguel Paolino <mpaolino@gmail.com>
+#
+# This program is free software, distributed under the terms of the
+# BSD 3-Clause License. See the LICENSE file at the top of the source tree for
+# details.
+
 import diesel
 from diesel import (Client, call)
 from collections import deque
@@ -141,7 +152,6 @@ class AsteriskAMIClient(Client):
 #        ev, response = diesel.first(sleep=timeout, waits=action_id)
 #        if ev == 'sleep':
 #            raise AMITimeout('AMI command timed out')
-
         response = diesel.wait(action_id)
 
         if response['response'] == 'Error':
@@ -412,17 +422,17 @@ class AsteriskAMIClient(Client):
 
     def parked_call(self):
         """ Check for a ParkedCall event """
-        message = { 'action': 'ParkedCall' }
+        message = { 'action': 'parkedcalll' }
         return self._send_command(message)
 
     def unparked_call(self):
         """ Check for an UnParkedCall event """
-        message = { 'action': 'UnParkedCall' }
+        message = { 'action': 'unparkedcall' }
         return self._send_command(message)
 
     def parked_calls(self):
         """ Retrieve set of parked calls """
-        message = { 'action': 'ParkedCalls' }
+        message = { 'action': 'parkedcalls' }
         return self._send_command(message)
 
     def pause_monitor(self, channel):
@@ -527,10 +537,136 @@ class AsteriskAMIClient(Client):
         message = { 'action': 'sippeers' }
         return self._send_command(message, stop_event='PeerlistComplete')
 
+        try:
+            response = self._send_command(message, stop_event='PeerlistComplete')
+        except AMICommandError:
+            return None
+        func = lambda x: 'event' in x and x['event'] == 'PeerEntry'
+        result = filter(func, response)
+        return result
+
+
+
     def sip_show_peer(self, peer):
         message = { 'action': 'sipshowpeer',
                     'peer': peer }
         return self._send_command(message)
 
+
+    def status(self, channel=None):
+        """Retrieve status for the given (or all) channels
+
+        The results come in via multi-event callback
+
+        channel -- channel name or None to retrieve all channels
+
+        returns deferred returning list of Status Events for each requested
+        channel
+        """
+        message = { 'action': 'status' }
+        if channel:
+            message['channel'] = channel
+        return self._send_command(message, stop_event='StatusComplete')
+
+    def stop_monitor(self, channel):
+        """Stop monitoring the given channel"""
+        message = { 'action': 'monitor',
+                    'channel': channel }
+        return self._send_command(message)
+
+    def unpause_monitor(self, channel):
+        """Resume recording a channel"""
+        message = { 'action': 'unpausemonitor',
+                    'channel': channel }
+        return self._send_command(message)
+
+    def update_config(self, srcfile, dstfile, mod_reload, headers={}):
+        """Update a configuration file
+
+        headers should be a dictionary with the following keys
+        Action-XXXXXX
+        Cat-XXXXXX
+        Var-XXXXXX
+        Value-XXXXXX
+        Match-XXXXXX
+        """
+        message = {}
+        if mod_reload in (True, 'yes', 1):
+            mod_reload = 'yes'
+        else:
+            mod_reload = 'no'
+        message = { 'action': 'updateconfig',
+                    'srcfilename': srcfile,
+                    'dstfilename': dstfile,
+                    'reload': mod_reload }
+        for k, v in headers.items():
+            message[k] = v
+        return self._send_command(message)
+
+    def user_event(self, event, **headers):
+        """Sends an arbitrary event to the Asterisk Manager Interface."""
+        message = { 'action': 'UserEvent',
+                    'userevent': event }
+        for i, j in headers.items():
+            message[i] = j
+        return self._send_command(message)
+
+    def wait_event(self, timeout):
+        """Waits for an event to occur
+
+        After calling this action, Asterisk will send you a Success response as
+        soon as another event is queued by the AMI
+        """
+        message = { 'action': 'WaitEvent',
+                    'timeout': timeout }
+        return self._send_command(message)
+
+    def dahdi_DND_off(self, channel):
+        """Toggles the DND state on the specified DAHDI channel to off"""
+        messge = { 'action': 'DAHDIDNDoff',
+                   'channel': channel }
+        return self._send_command(message)
+
+    def dahdi_DND_on(self, channel):
+        """Toggles the DND state on the specified DAHDI channel to on"""
+        messge = { 'action': 'DAHDIDNDon',
+                   'channel': channel }
+        return self._send_command(message)
+
+    def dahdi_dial_offhook(self, channel, number):
+        """Dial a number on a DAHDI channel while off-hook"""
+        message = { 'action': 'DAHDIDialOffhook',
+                    'dahdichannel': channel,
+                    'number': number }
+        return self._send_command(message)
+
+    def dahdi_hangup(self, channel):
+        """Hangs up the specified DAHDI channel"""
+        message = { 'action': 'DAHDIHangup',
+                    'dahdichannel': channel }
+        return self._send_command(message)
+
+    def dahdi_restart(self, channel):
+        """Restarts the DAHDI channels, terminating any calls in progress"""
+        message = { 'action': 'DAHDIRestart',
+                    'dahdichannel': channel }
+        return self._send_command(message)
+
+    def dahdi_show_channels(self):
+        """List all DAHDI channels"""
+        message = { 'action': 'DAHDIShowChannels' }
+        return self._send_command(message)
+
+    def dahdi_transfer(self, channel):
+        """Transfers DAHDI channel"""
+        message = { 'action': 'DAHDITransfer',
+                    'channel': channel }
+        return self._send_command(message)
+
+    def reload(self, module):
+        """Reload modules"""
+        message = {'action': 'Reload',
+                   'module': module}
+        return self.sendDeferred(message).addCallback(self.errorUnlessResponse)
 
 
