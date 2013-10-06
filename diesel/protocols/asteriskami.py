@@ -11,21 +11,28 @@
 
 import diesel
 from diesel import (Client, call)
-from collections import deque
+from diesel.util.queue import Queue
 import uuid
 
-import ipdb
+import pdb
 
 AMI_PORT = 5038
 
 
-class AMIException(Exception) : pass
+class AMIException(Exception):
+    pass
 
-class AMIError(AMIException): pass
 
-class AMITimeout(AMIException): pass
+class AMIError(AMIException):
+    pass
 
-class AMICommandError(AMIException): pass
+
+class AMITimeout(AMIException):
+    pass
+
+
+class AMICommandError(AMIException):
+    pass
 
 
 class AsteriskAMIClient(Client):
@@ -40,19 +47,19 @@ class AsteriskAMIClient(Client):
         self.port = port
         self.username = username
         self.secret = secret
-        self._events = [ 'Newchannel', 'Hangup', 'Newexten', 'Newstate',
-                         'Reload', 'Shutdown', 'ExtensionsStatus', 'Rename',
-                         'Newcallerid', 'Alarm', 'AlarmClear',
-                         'Agentcallbacklogoff', 'Agentcallbacklogin',
-                         'Agentlogin', 'Agentlogoff', 'MeetmeJoin',
-                         'MeetmeLeave', 'MessageWaiting', 'Join',
-                         'Leave', 'AgentCalled', 'ParkedCall',
-                         'UnParkedCall', 'ParkedCalls', 'Cdr',
-                         'ParkedCallsComplete', 'QueueParams',
-                         'QueueMember' ]
+        self._events = ['Newchannel', 'Hangup', 'Newexten', 'Newstate',
+                        'Reload', 'Shutdown', 'ExtensionsStatus', 'Rename',
+                        'Newcallerid', 'Alarm', 'AlarmClear',
+                        'Agentcallbacklogoff', 'Agentcallbacklogin',
+                        'Agentlogin', 'Agentlogoff', 'MeetmeJoin',
+                        'MeetmeLeave', 'MessageWaiting', 'Join',
+                        'Leave', 'AgentCalled', 'ParkedCall',
+                        'UnParkedCall', 'ParkedCalls', 'Cdr',
+                        'ParkedCallsComplete', 'QueueParams',
+                        'QueueMember']
         self._subscriptions = dict.fromkeys(self._events)
+        self._queues = {}
         Client.__init__(self, host, port, **kw)
-
 
     @call
     def on_connect(self):
@@ -74,9 +81,9 @@ class AsteriskAMIClient(Client):
             if ev == 'sleep':
                 continue
             parsed = self._parse(data)
-            #print(parsed)
-            if 'actionid' in parsed:
-                diesel.fire(parsed['actionid'], parsed)
+            # Check if there is a queue for responses and message send over it
+            if 'actionid' in parsed and parsed['actionid'] in self._queues:
+                self._queues[parsed['actionid']].put(parsed)
             elif 'event' in parsed:
                 event = parsed['event']
                 if event in self._subscriptions and self._subscriptions[event]:
@@ -88,7 +95,6 @@ class AsteriskAMIClient(Client):
                     # doesn't have a handler are not interesting
                     # TODO: Log something?
                     print("Discarting: %s" % str(event))
-                    pass
 
     def _parse(self, message):
         response = {}
@@ -114,9 +120,9 @@ class AsteriskAMIClient(Client):
         '''
             Authenticate
         '''
-        login_args = { 'action': 'login',
-                       'username': self.username,
-                       'secret': self.secret }
+        login_args = {'action': 'login',
+                      'username': self.username,
+                      'secret': self.secret}
         response = self._send_command(login_args)
         if 'response' not in response or response['response'] != 'Success':
             raise AMICommandError(response['message'])
@@ -136,35 +142,40 @@ class AsteriskAMIClient(Client):
             raise AMIError('refusing to send empty command')
 
         action_id = self._generate_action_id()
+        # Setup this action queue to get the responses
+        queue = Queue()
+        self._queues[action_id] = queue
+
         cmd_dict['actionid'] = action_id
+
+        #print("Asked to send: %s" % cmd_dict)
         # Transform key:value dict to string array
         # of "key: value" elements
-        cmds = map(lambda x: ''.join([x[0],': ', x[1],
-                              '\r\n'] ),
+        cmds = map(lambda x: ''.join([x[0], ': ', x[1],
+                                      '\r\n']),
                    cmd_dict.items())
         # Append last empty line and send
         cmds.append('\r\n')
-        print("Sending: %s" % str(cmds))
+        #print("Sending: %s" % str(cmds))
         diesel.send(''.join(cmds))
-#        sleep is scheduled and triggered even when waits is triggered
-#        first. Let's workaround and just wait for the data forever.
-#        TODO: find a proper way of doing this.
-#        ev, response = diesel.first(sleep=timeout, waits=action_id)
-#        if ev == 'sleep':
-#            raise AMITimeout('AMI command timed out')
-        response = diesel.wait(action_id)
 
-        if response['response'] == 'Error':
+        #print "Waiting for response %s" % action_id
+        response = queue.get()
+ 
+        #print "Got response" % response
+        if 'response' in response and response['response'] == 'Error':
             raise AMICommandError(response['message'])
 
         if stop_event is None:
+            del self._queues[action_id]
             return response
-
+        
         response_list = []
         while 'event' not in response or stop_event != response['event']:
+            response = queue.get()
             response_list.append(response)
-            response = diesel.wait(action_id)
-        response_list.append(response)
+
+        del self._queues[action_id] 
         return response_list
 
     def subscribe(self, event, handler):
@@ -185,15 +196,13 @@ class AsteriskAMIClient(Client):
             self._subscriptions[event] = []
         self._subscriptions[event].append(handler)
 
-
     # User API
     def absolute_timeout(self, channel, timeout):
         """ Set timeout value for the given channel (in seconds) """
-        message = { 'action': 'AbsoluteTimeout',
-                    'timeout': timeout,
-                    'channel': channel }    
+        message = {'action': 'AbsoluteTimeout',
+                   'timeout': timeout,
+                   'channel': channel}
         return self._send_command(message)
-
 
     def agent_logoff(self, agent, soft):
         """ Logs off the specified agent for the queue system """
@@ -201,55 +210,49 @@ class AsteriskAMIClient(Client):
             soft = 'true'
         else:
             soft = 'false'
-        message = { 'action': 'AgentLogoff',
-                    'agent': agent,
-                    'soft': soft }
+        message = {'action': 'AgentLogoff',
+                   'agent': agent,
+                   'soft': soft}
         return self._send_command(message)
-
 
     def agents(self):
         """ Retrieve agents information """
-        message = { "action": "agents" }
+        message = {"action": "agents"}
         return self._send_command(message)
-
 
     def change_monitor(self, channel, filename):
         """ Change the file to which the channel is to be recorded """
-        message = { 'action': 'changemonitor',
-                    'channel': channel,
-                    'filename': filename }
+        message = {'action': 'changemonitor',
+                   'channel': channel,
+                   'filename': filename}
         return self._send_command(message)
-
 
     def command(self, command):
         """ Run asterisk CLI command """
-        message = { 'action': 'command',
-                    'command': command }
+        message = {'action': 'command',
+                   'command': command}
         return self._send_command(message)
-
 
     def db_del(self, family, key):
         """ Delete key value in the AstDB database """
-        message = { 'action': 'dbdel',
-                    'family': family,
-                    'key': key }
+        message = {'action': 'dbdel',
+                   'family': family,
+                   'key': key}
         return self._send_command(message)
-
 
     def db_del_tree(self, family, key=None):
         """ Delete key value or key tree in the AstDB database """
-        message = { 'action': 'dbdeltree',
-                    'family': family }
+        message = {'action': 'dbdeltree',
+                   'family': family}
         if key is not None:
             message['key'] = key
         return self._send_command(message)
 
-
     def db_get(self, family, key):
         """ This action retrieves a value from the AstDB database """
-        message = { 'action': 'DBGet',
-                    'family': family,
-                    'key': key }
+        message = {'action': 'DBGet',
+                   'family': family,
+                   'key': key}
         try:
             response = self._send_command(message, stop_event='DBGetResponse')
         except AMICommandError:
@@ -259,13 +262,12 @@ class AsteriskAMIClient(Client):
             return None
         return response['val']
 
-
     def db_put(self, family, key, value):
         """ Sets a key value in the AstDB database """
-        message = { 'action': 'dbput',
-                    'family': family,
-                    'key': key,
-                    'val': value }
+        message = {'action': 'dbput',
+                   'family': family,
+                   'key': key,
+                   'val': value}
         return self._send_command(message)
 
     def events(self, eventmask=False):
@@ -275,8 +277,8 @@ class AsteriskAMIClient(Client):
         elif eventmask in ('on', True, 1):
             eventmask = 'on'
         # otherwise is likely a type-mask
-        message = { 'action': 'events',
-                    'eventmask': eventmask }
+        message = {'action': 'events',
+                   'eventmask': eventmask}
         return self._send_command(message)
 
     def extension_state(self, exten, context):
@@ -293,34 +295,33 @@ class AsteriskAMIClient(Client):
          0    Idle
          1    In use
          2    Busy"""
-        message = { 'action': 'extensionstate',
-                    'exten': exten,
-                    'context': context }
+        message = {'action': 'extensionstate',
+                   'exten': exten,
+                   'context': context}
         return self._send_command(message)
-
 
     def get_config(self, filename):
         """ Retrieves the data from an Asterisk configuration file """
-        message = { 'action': 'getconfig',
-                    'filename': filename }
+        message = {'action': 'getconfig',
+                   'filename': filename}
         return self._send_command(message)
 
     def get_var(self, channel, variable):
         """ Retrieve the given variable from the channel """
 
-        message = { 'action': 'getvar',
-                    'channel': channel,
-                    'variable': variable }
+        message = {'action': 'getvar',
+                   'channel': channel,
+                   'variable': variable}
 
         response = self._send_command(message)
         if 'value' in response:
             return response['val']
-        return None 
-        
+        return None
+
     def hangup(self, channel):
         """ Tell channel to hang up """
-        message = { 'action': 'hangup',
-                    'channel': channel }
+        message = {'action': 'hangup',
+                   'channel': channel}
         return self._send_command(message)
 
     def list_commands(self):
@@ -329,12 +330,12 @@ class AsteriskAMIClient(Client):
 
         Returns a single message with each command-name as a key
         """
-        message = { 'action': 'listcommands' }
+        message = {'action': 'listcommands'}
         return self._send_command(message)
 
     def logoff(self):
         """ Log off from the manager instance """
-        message = { 'action': 'logoff' }
+        message = {'action': 'logoff'}
         response = self._send_command(message)
         if response['response'] == 'Goodbye':
             return True
@@ -342,43 +343,43 @@ class AsteriskAMIClient(Client):
 
     def mailbox_count(self, mailbox):
         """ Get count of messages in the given mailbox """
-        message = { 'action': 'mailboxcount',
-                    'mailbox': mailbox }
+        message = {'action': 'mailboxcount',
+                   'mailbox': mailbox}
         return self._send_command(message)
 
     def mailbox_status(self, mailbox):
         """ Get status of given mailbox """
-        message = { 'action': 'mailboxstatus',
-                    'mailbox': mailbox }
+        message = {'action': 'mailboxstatus',
+                   'mailbox': mailbox}
         return self._send_command(message)
 
     def meetme_mute(self, meetme, usernum):
         """ Mute a user in a given meetme """
-        message = { 'action': 'meetmemute',
-                    'meetme': meetme,
-                    'usernum': usernum }
+        message = {'action': 'meetmemute',
+                   'meetme': meetme,
+                   'usernum': usernum}
         return self._send_command(message)
 
     def meetme_unmute(self, meetme, usernum):
         """ Unmute a specified user in a given meetme"""
-        message = { 'action': 'meetmeunmute',
-                    'meetme': meetme,
-                    'usernum': usernum }
+        message = {'action': 'meetmeunmute',
+                   'meetme': meetme,
+                   'usernum': usernum}
         return self._send_command(message)
 
     def monitor(self, channel, filename, fileformat, mix):
         """Record given channel to a file (or attempt to anyway)"""
-        message = { 'action': 'monitor',
-                    'channel': channel,
-                    'file': filename,
-                    'format': fileformat,
-                    'mix': mix }
+        message = {'action': 'monitor',
+                   'channel': channel,
+                   'file': filename,
+                   'format': fileformat,
+                   'mix': mix}
         return self._send_command(message)
 
-    def originate(self, channel, context=None, exten=None, priority=None, 
-            timeout=None, callerid=None, account=None, application=None,
-            data=None, variable={}, async=False
-        ):
+    def originate(self, channel, context=None, exten=None, priority=None,
+                  timeout=None, callerid=None, account=None, application=None,
+                  data=None, variable={}, async=False
+                  ):
         """Originate call to connect channel to given context/exten/priority
 
         channel -- the outgoing channel to which will be dialed
@@ -414,44 +415,44 @@ class AsteriskAMIClient(Client):
 
     def park(self, channel, channel2, timeout):
         """ Park channel """
-        message = { 'action': 'park',
-                    'channel': channel,
-                    'channel2': channel2,
-                    'timeout': timeout }
+        message = {'action': 'park',
+                   'channel': channel,
+                   'channel2': channel2,
+                   'timeout': timeout}
         return self._send_command(message)
 
     def parked_call(self):
         """ Check for a ParkedCall event """
-        message = { 'action': 'parkedcalll' }
+        message = {'action': 'parkedcalll'}
         return self._send_command(message)
 
     def unparked_call(self):
         """ Check for an UnParkedCall event """
-        message = { 'action': 'unparkedcall' }
+        message = {'action': 'unparkedcall'}
         return self._send_command(message)
 
     def parked_calls(self):
         """ Retrieve set of parked calls """
-        message = { 'action': 'parkedcalls' }
+        message = {'action': 'parkedcalls'}
         return self._send_command(message)
 
     def pause_monitor(self, channel):
         """ Temporarily stop recording the channel """
-        message = { 'action': 'pausemonitor',
-                    'channel': channel }
+        message = {'action': 'pausemonitor',
+                   'channel': channel}
         return self._send_command(message)
 
     def ping(self):
         """ Check to see if the manager is alive... """
-        message = { 'action': 'ping' }
+        message = {'action': 'ping'}
         response = self._send_command(message)
         return True
 
     def play_dtmf(self, channel, digit):
         """ Play DTMF on a given channel """
-        message = { 'action': 'playdtmf',
-                    'channel': channel,
-                    'digit': digit }
+        message = {'action': 'playdtmf',
+                   'channel': channel,
+                   'digit': digit}
         return self._send_command(message)
 
     def queue_add(self, queue, interface, penalty=0, paused=True):
@@ -460,11 +461,11 @@ class AsteriskAMIClient(Client):
             paused = 'true'
         else:
             paused = 'false'
-        message = { 'action': 'queueadd',
-                    'queue': queue,
-                    'interface': interface,
-                    'penalty': penalty,
-                    'paused': paused }
+        message = {'action': 'queueadd',
+                   'queue': queue,
+                   'interface': interface,
+                   'penalty': penalty,
+                   'paused': paused}
         return self._send_command(message)
 
     def queue_pause(self, queue, interface, paused=True):
@@ -472,28 +473,28 @@ class AsteriskAMIClient(Client):
             paused = 'true'
         else:
             paused = 'false'
-        message = { 'action': 'queuepause',
-                    'queue': queue,
-                    'interface': interface,
-                    'paused': paused }
+        message = {'action': 'queuepause',
+                   'queue': queue,
+                   'interface': interface,
+                   'paused': paused}
         return self._send_command(message)
 
     def queue_remove(self, queue, interface):
         """ Remove given interface from named queue """
-        message = { 'action': 'queueremove',
-                    'queue': queue,
-                    'interface': interface }
+        message = {'action': 'queueremove',
+                   'queue': queue,
+                   'interface': interface}
         return self._send_command(message)
 
     def queues(self):
         """ Retrieve information about active queues via multiple events """
         # XXX AMI returns improperly formatted lines so this doesn't work now.
-        message = { 'action': 'queues' }
+        message = {'action': 'queues'}
         return self._send_command(message)
 
     def queue_status(self, queue=None, member=None):
         """ Retrieve information about active queues via multiple events """
-        message = { 'action': 'queuestatus' }
+        message = {'action': 'queuestatus'}
         if queue is not None:
             message.update({'queue': queue})
         if member is not None:
@@ -503,11 +504,11 @@ class AsteriskAMIClient(Client):
 
     def redirect(self, channel, context, exten, priority, extrachannel=None):
         """ Transfer channel(s) to given context/exten/priority """
-        message = { 'action': 'redirect',
-                    'channel': channel,
-                    'context': context,
-                    'exten': exten,
-                    'priority': priority }
+        message = {'action': 'redirect',
+                   'channel': channel,
+                   'context': context,
+                   'exten': exten,
+                   'priority': priority}
         if extrachannel is not None:
             message['extrachannel'] = extrachannel
         return self._send_command(message)
@@ -518,40 +519,39 @@ class AsteriskAMIClient(Client):
             append = 'true'
         else:
             append = 'false'
-        message = { 'channel': channel,
-                    'userfield': userField,
-                    'append': append }
+        message = {'channel': channel,
+                   'userfield': userField,
+                   'append': append}
         return self._send_command(message)
 
     def set_var(self, channel, variable, value):
         """ Set channel variable to given value """
-        message = { 'action': 'setvar',
-                    'channel': channel,
-                    'variable': variable,
-                    'value': value }
+        message = {'action': 'setvar',
+                   'channel': channel,
+                   'variable': variable,
+                   'value': value}
         return self._send_command(message)
 
     def sip_peers(self):
         """ List all known sip peers """
-        # TODO: this shit is not going to work, fix it
-        message = { 'action': 'sippeers' }
-        return self._send_command(message, stop_event='PeerlistComplete')
-
+        message = {'action': 'sippeers'}
         try:
-            response = self._send_command(message, stop_event='PeerlistComplete')
+            response = self._send_command(
+                    message, stop_event='PeerlistComplete')
         except AMICommandError:
             return None
-        func = lambda x: 'event' in x and x['event'] == 'PeerEntry'
-        result = filter(func, response)
+        result = [i for i in response if 'event' in i and \
+                  i['event'] == 'PeerEntry']
         return result
 
-
-
     def sip_show_peer(self, peer):
-        message = { 'action': 'sipshowpeer',
-                    'peer': peer }
-        return self._send_command(message)
-
+        message = {'action': 'sipshowpeer',
+                   'peer': peer}
+        try:
+            response = self._send_command(message)
+        except AMICommandError:
+            return None
+        return response
 
     def status(self, channel=None):
         """Retrieve status for the given (or all) channels
@@ -563,21 +563,21 @@ class AsteriskAMIClient(Client):
         returns deferred returning list of Status Events for each requested
         channel
         """
-        message = { 'action': 'status' }
+        message = {'action': 'status'}
         if channel:
             message['channel'] = channel
         return self._send_command(message, stop_event='StatusComplete')
 
     def stop_monitor(self, channel):
         """Stop monitoring the given channel"""
-        message = { 'action': 'monitor',
-                    'channel': channel }
+        message = {'action': 'monitor',
+                   'channel': channel}
         return self._send_command(message)
 
     def unpause_monitor(self, channel):
         """Resume recording a channel"""
-        message = { 'action': 'unpausemonitor',
-                    'channel': channel }
+        message = {'action': 'unpausemonitor',
+                   'channel': channel}
         return self._send_command(message)
 
     def update_config(self, srcfile, dstfile, mod_reload, headers={}):
@@ -595,18 +595,18 @@ class AsteriskAMIClient(Client):
             mod_reload = 'yes'
         else:
             mod_reload = 'no'
-        message = { 'action': 'updateconfig',
-                    'srcfilename': srcfile,
-                    'dstfilename': dstfile,
-                    'reload': mod_reload }
+        message = {'action': 'updateconfig',
+                   'srcfilename': srcfile,
+                   'dstfilename': dstfile,
+                   'reload': mod_reload}
         for k, v in headers.items():
             message[k] = v
         return self._send_command(message)
 
     def user_event(self, event, **headers):
         """Sends an arbitrary event to the Asterisk Manager Interface."""
-        message = { 'action': 'UserEvent',
-                    'userevent': event }
+        message = {'action': 'UserEvent',
+                   'userevent': event}
         for i, j in headers.items():
             message[i] = j
         return self._send_command(message)
@@ -617,50 +617,50 @@ class AsteriskAMIClient(Client):
         After calling this action, Asterisk will send you a Success response as
         soon as another event is queued by the AMI
         """
-        message = { 'action': 'WaitEvent',
-                    'timeout': timeout }
+        message = {'action': 'WaitEvent',
+                   'timeout': timeout}
         return self._send_command(message)
 
     def dahdi_DND_off(self, channel):
         """Toggles the DND state on the specified DAHDI channel to off"""
-        messge = { 'action': 'DAHDIDNDoff',
-                   'channel': channel }
+        messge = {'action': 'DAHDIDNDoff',
+                  'channel': channel}
         return self._send_command(message)
 
     def dahdi_DND_on(self, channel):
         """Toggles the DND state on the specified DAHDI channel to on"""
-        messge = { 'action': 'DAHDIDNDon',
-                   'channel': channel }
+        messge = {'action': 'DAHDIDNDon',
+                  'channel': channel}
         return self._send_command(message)
 
     def dahdi_dial_offhook(self, channel, number):
         """Dial a number on a DAHDI channel while off-hook"""
-        message = { 'action': 'DAHDIDialOffhook',
-                    'dahdichannel': channel,
-                    'number': number }
+        message = {'action': 'DAHDIDialOffhook',
+                   'dahdichannel': channel,
+                   'number': number}
         return self._send_command(message)
 
     def dahdi_hangup(self, channel):
         """Hangs up the specified DAHDI channel"""
-        message = { 'action': 'DAHDIHangup',
-                    'dahdichannel': channel }
+        message = {'action': 'DAHDIHangup',
+                   'dahdichannel': channel}
         return self._send_command(message)
 
     def dahdi_restart(self, channel):
         """Restarts the DAHDI channels, terminating any calls in progress"""
-        message = { 'action': 'DAHDIRestart',
-                    'dahdichannel': channel }
+        message = {'action': 'DAHDIRestart',
+                   'dahdichannel': channel}
         return self._send_command(message)
 
     def dahdi_show_channels(self):
         """List all DAHDI channels"""
-        message = { 'action': 'DAHDIShowChannels' }
+        message = {'action': 'DAHDIShowChannels'}
         return self._send_command(message)
 
     def dahdi_transfer(self, channel):
         """Transfers DAHDI channel"""
-        message = { 'action': 'DAHDITransfer',
-                    'channel': channel }
+        message = {'action': 'DAHDITransfer',
+                   'channel': channel}
         return self._send_command(message)
 
     def reload(self, module):
@@ -668,5 +668,3 @@ class AsteriskAMIClient(Client):
         message = {'action': 'Reload',
                    'module': module}
         return self.sendDeferred(message).addCallback(self.errorUnlessResponse)
-
-
